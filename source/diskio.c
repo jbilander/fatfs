@@ -1,7 +1,6 @@
 /**
  * diskio.c - FatFs low-level disk I/O layer for RP2350 SPI0 SD card
- * Author: ChatGPT
- * License: MIT
+ * Debug-enabled write tracing
  */
 
 #include "main.h"
@@ -11,6 +10,7 @@
 #include "hardware/spi.h"
 #include "hardware/gpio.h"
 #include "pico/time.h"
+#include "pico/stdio.h"
 #include <string.h>
 
 // -----------------------------------------------------------------------------
@@ -37,7 +37,7 @@ extern mutex_t spi_mutex;
 static bool card_initialized = false;
 
 // -----------------------------------------------------------------------------
-// SPI helper functions
+// SPI helpers
 static inline void sd_cs_low(void)  { gpio_put(PIN_SS, 0); }
 static inline void sd_cs_high(void) { gpio_put(PIN_SS, 1); }
 
@@ -60,7 +60,7 @@ static void spi_send_dummy_clocks(uint32_t count) {
 }
 
 // -----------------------------------------------------------------------------
-// SD card protocol helper functions
+// SD command helpers
 static uint8_t sd_send_cmd(uint8_t cmd, uint32_t arg, uint8_t crc) {
     uint8_t buf[6];
     buf[0] = 0x40 | cmd;
@@ -73,7 +73,6 @@ static uint8_t sd_send_cmd(uint8_t cmd, uint32_t arg, uint8_t crc) {
     sd_cs_low();
     spi_write_buf(buf, 6);
 
-    // Wait for response (R1)
     uint8_t resp;
     for (int i = 0; i < 8; i++) {
         resp = spi_txrx(SD_DUMMY_BYTE);
@@ -94,17 +93,28 @@ static bool sd_wait_ready(uint32_t timeout_ms) {
 }
 
 static bool sd_send_data_block(const uint8_t *buff, uint8_t token) {
-    if (!sd_wait_ready(500)) return false;
+    if (!sd_wait_ready(500)) {
+        printf("Debug: SD not ready before write\n");
+        return false;
+    }
 
     spi_txrx(token);
     spi_write_buf(buff, SD_SECTOR_SIZE);
 
-    // dummy CRC
     spi_txrx(0xFF);
     spi_txrx(0xFF);
 
     uint8_t resp = spi_txrx(SD_DUMMY_BYTE);
-    if ((resp & 0x1F) != 0x05) return false;
+    if ((resp & 0x1F) != 0x05) {
+        printf("Debug: Data reject, resp=0x%02X\n", resp);
+        return false;
+    }
+
+    // Wait until card is ready again (write complete)
+    if (!sd_wait_ready(500)) {
+        printf("Debug: Card not ready after write\n");
+        return false;
+    }
 
     return true;
 }
@@ -120,16 +130,13 @@ static bool sd_receive_data_block(uint8_t *buff, uint32_t bytes) {
     if (token != SD_TOKEN_START_BLOCK) return false;
 
     spi_read_buf(buff, bytes);
-
-    // discard CRC
     spi_txrx(SD_DUMMY_BYTE);
     spi_txrx(SD_DUMMY_BYTE);
-
     return true;
 }
 
 // -----------------------------------------------------------------------------
-// Disk I/O interface implementation
+// Disk I/O functions
 DSTATUS disk_initialize(BYTE pdrv) {
     (void)pdrv;
 
@@ -150,31 +157,24 @@ DSTATUS disk_initialize(BYTE pdrv) {
         return STA_NOINIT;
     }
 
-    // Check voltage range
     resp = sd_send_cmd(SD_CMD8, 0x1AA, 0x87);
-    if (resp & 0x04) {
-        // Illegal command, probably an old card
-    } else {
+    if ((resp & 0x04) == 0) {
         uint8_t ocr[4];
         spi_read_buf(ocr, 4);
     }
 
-    // Wait for ACMD41 to complete
     tries = 2000;
     do {
         sd_send_cmd(SD_CMD55, 0, 0x65);
         resp = sd_send_cmd(SD_ACMD41, 0x40000000, 0x77);
     } while (resp != 0x00 && --tries);
 
-    // CMD58 to read OCR (optional)
     sd_send_cmd(SD_CMD58, 0, 0);
     uint8_t ocr[4];
     spi_read_buf(ocr, 4);
 
-    // Set block size to 512 bytes
     sd_send_cmd(SD_CMD16, SD_SECTOR_SIZE, 0x15);
     sd_cs_high();
-
     spi_txrx(SD_DUMMY_BYTE);
     spi_set_baudrate(spi0, SPI_FAST_FREQUENCY);
 
@@ -206,13 +206,23 @@ DRESULT disk_write(BYTE pdrv, const BYTE *buff, LBA_t sector, UINT count) {
     (void)pdrv;
     if (!card_initialized) return RES_NOTRDY;
 
+    printf("Debug: disk_write sector=%lu, count=%u\n", (uint32_t)sector, count);
+
     mutex_enter_blocking(&spi_mutex);
-    sd_send_cmd(SD_CMD24, sector, 0x01);
-    bool ok = sd_send_data_block(buff, SD_TOKEN_START_BLOCK);
+    uint8_t resp = sd_send_cmd(SD_CMD24, sector, 0x01);
+    printf("Debug: CMD24 resp=0x%02X\n", resp);
+
+    bool ok = false;
+    if (resp == 0x00)
+        ok = sd_send_data_block(buff, SD_TOKEN_START_BLOCK);
+    else
+        printf("Debug: CMD24 failed\n");
+
     sd_cs_high();
     spi_txrx(SD_DUMMY_BYTE);
     mutex_exit(&spi_mutex);
 
+    printf("Debug: disk_write result=%d\n", ok);
     return ok ? RES_OK : RES_ERROR;
 }
 
@@ -228,7 +238,7 @@ DRESULT disk_ioctl(BYTE pdrv, BYTE cmd, void *buff) {
             *(DWORD *)buff = 1;
             return RES_OK;
         case GET_SECTOR_COUNT:
-            *(DWORD *)buff = 0; // optional, can query with CMD9 if needed
+            *(DWORD *)buff = 0;
             return RES_OK;
         default:
             return RES_PARERR;
