@@ -1,6 +1,6 @@
 /*
  * diskio.c - FatFs low-level disk I/O layer for RP2350 (spi0)
- * Production version: mutex-protected, SDHC-aware, single-block R/W
+ * Production version: SDHC-aware, single-block R/W
  */
 
 #include "main.h"
@@ -11,12 +11,8 @@
 #include "hardware/gpio.h"
 #include "pico/stdlib.h"
 #include "pico/time.h"
-#include "pico/mutex.h"
 #include <string.h>
 #include <stdint.h>
-
-/* Shared SPI mutex declared in main.h */
-extern mutex_t spi_mutex;
 
 /* SD commands */
 #define CMD0    (0x40+0)
@@ -135,7 +131,6 @@ static bool sd_send_block(const uint8_t *buf, uint8_t token) {
 DSTATUS disk_initialize(BYTE pdrv) {
     (void)pdrv;
 
-    mutex_enter_blocking(&spi_mutex);
     spi_set_baudrate(spi0, SPI_SLOW_FREQUENCY);
 
     sd_cs_high();
@@ -152,7 +147,6 @@ DSTATUS disk_initialize(BYTE pdrv) {
     } while (--i);
 
     if (r != 1) {
-        mutex_exit(&spi_mutex);
         card_initialized = false;
         return STA_NOINIT;
     }
@@ -198,7 +192,6 @@ DSTATUS disk_initialize(BYTE pdrv) {
     spi_set_baudrate(spi0, SPI_FAST_FREQUENCY);
 
     card_initialized = true;
-    mutex_exit(&spi_mutex);
     return 0;
 }
 
@@ -211,26 +204,21 @@ DRESULT disk_read(BYTE pdrv, BYTE *buff, LBA_t sector, UINT count) {
     (void)pdrv;
     if (!card_initialized) return RES_NOTRDY;
 
-    mutex_enter_blocking(&spi_mutex);
-
     if (!sd_is_sdhc) sector *= SD_SECTOR_SIZE;
 
     for (UINT i = 0; i < count; ++i) {
         if (sd_send_cmd(CMD17, (uint32_t)(sector + i), 0x01) != 0) {
             sd_cs_high();
-            mutex_exit(&spi_mutex);
             return RES_ERROR;
         }
         if (!sd_receive_block(buff + i * SD_SECTOR_SIZE)) {
             sd_cs_high();
-            mutex_exit(&spi_mutex);
             return RES_ERROR;
         }
         sd_cs_high();
         spi_xfer(SD_DUMMY_BYTE);
     }
 
-    mutex_exit(&spi_mutex);
     return RES_OK;
 }
 
@@ -238,26 +226,21 @@ DRESULT disk_write(BYTE pdrv, const BYTE *buff, LBA_t sector, UINT count) {
     (void)pdrv;
     if (!card_initialized) return RES_NOTRDY;
 
-    mutex_enter_blocking(&spi_mutex);
-
     if (!sd_is_sdhc) sector *= SD_SECTOR_SIZE;
 
     for (UINT i = 0; i < count; ++i) {
         if (sd_send_cmd(CMD24, (uint32_t)(sector + i), 0x01) != 0) {
             sd_cs_high();
-            mutex_exit(&spi_mutex);
             return RES_ERROR;
         }
         if (!sd_send_block(buff + i * SD_SECTOR_SIZE, SD_TOKEN_START_BLOCK)) {
             sd_cs_high();
-            mutex_exit(&spi_mutex);
             return RES_ERROR;
         }
         sd_cs_high();
         spi_xfer(SD_DUMMY_BYTE);
     }
 
-    mutex_exit(&spi_mutex);
     return RES_OK;
 }
 
@@ -279,4 +262,3 @@ DRESULT disk_ioctl(BYTE pdrv, BYTE cmd, void *buff) {
             return RES_PARERR;
     }
 }
-
